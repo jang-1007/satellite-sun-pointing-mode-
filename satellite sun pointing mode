@@ -1,0 +1,124 @@
+1번 최종 #include <Wire.h>
+#include <Arduino.h>
+#include <SoftwareSerial.h>
+
+SoftwareSerial BTSerial(10, 11);
+
+// 핀
+#define MotorSpeedPin 5
+#define CWPin         3
+#define CCWPin        4
+#define Cds1Pin       A1
+#define Cds2Pin       A3
+
+// MPU
+const uint8_t MPU_ADDR = 0x68;
+int16_t AcX, AcY, AcZ, GyX, GyY, GyZ;
+float ax, ay, az, gx, gy, gz;
+float ax_f, ay_f, az_f;
+
+// 상태
+int motorSpeedVal = 0;
+int MotorDir = 0;
+int Cds1Val = 0, Cds2Val = 0;
+
+// 필터
+float dt = 0.01f;
+float alpha_acc = 0.9f;
+float alpha_comp = 0.98f;
+float pitch_f = 0.0f;
+
+// ★ 조도 임계 & 히스테리시스/최소 PWM
+const int TH_BRIGHT = 150;      // 밝음 기준 (값↓가 밝음이지만, 모듈마다 다르므로 일단 180)
+const int TH_DARK   = 500;      // 어두움 기준 (히스테리시스 폭 40)
+const int MIN_PWM   = 180;      // 정지 마찰 돌파용 최소 PWM
+const int PWM_CW    = 220;      // CW 구동값
+const int PWM_CCW   = 220;      // CCW 구동값
+
+inline void motorPWM(uint8_t pwm){
+  if (pwm>0 && pwm<MIN_PWM) pwm = MIN_PWM;
+  analogWrite(MotorSpeedPin, pwm);
+  motorSpeedVal = pwm;
+}
+inline void motorCW(){  digitalWrite(CWPin,HIGH); digitalWrite(CCWPin,LOW);  MotorDir=+1; }
+inline void motorCCW(){ digitalWrite(CWPin,LOW);  digitalWrite(CCWPin,HIGH); MotorDir=-1; }
+inline void motorStop(){ motorPWM(0); MotorDir=0; }
+
+int readCds1(){ return analogRead(Cds1Pin); }
+int readCds2(){ return analogRead(Cds2Pin); }
+
+bool mpuBegin(){
+  Wire.begin(); delay(50);
+  Wire.beginTransmission(MPU_ADDR); Wire.write(0x6B); Wire.write(0x00); if (Wire.endTransmission(true)!=0) return false;
+  Wire.beginTransmission(MPU_ADDR); Wire.write(0x1B); Wire.write(0x00); if (Wire.endTransmission(true)!=0) return false;
+  Wire.beginTransmission(MPU_ADDR); Wire.write(0x1C); Wire.write(0x00); if (Wire.endTransmission(true)!=0) return false;
+  return true;
+}
+void mpuReadRaw(){
+  Wire.beginTransmission(MPU_ADDR); Wire.write(0x3B); Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR,(uint8_t)14,(uint8_t)true);
+  if (Wire.available()<14) return;
+  AcX=(Wire.read()<<8)|Wire.read(); AcY=(Wire.read()<<8)|Wire.read(); AcZ=(Wire.read()<<8)|Wire.read();
+  (void)((Wire.read()<<8)|Wire.read());
+  GyX=(Wire.read()<<8)|Wire.read(); GyY=(Wire.read()<<8)|Wire.read(); GyZ=(Wire.read()<<8)|Wire.read();
+  ax=(float)AcX/16384.0f; ay=(float)AcY/16384.0f; az=(float)AcZ/16384.0f;
+  gx=(float)GyX/131.0f;   gy=(float)GyY/131.0f;   gz=(float)GyZ/131.0f;
+}
+void updateComplementaryFilter(){
+  ax_f = alpha_acc*ax_f + (1.0f-alpha_acc)*ax;
+  ay_f = alpha_acc*ay_f + (1.0f-alpha_acc)*ay;
+  az_f = alpha_acc*az_f + (1.0f-alpha_acc)*az;
+  float pitch_acc = atan2(ay_f, sqrt(ax_f*ax_f + az_f*az_f))*180.0f/PI;
+  pitch_f = alpha_comp*(pitch_f + gy*dt) + (1.0f - alpha_comp)*pitch_acc;
+}
+
+// 전송
+void sendCSV(Stream &out){
+  out.print(Cds1Val); out.print(','); out.print(Cds2Val); out.print(',');
+  out.print(MotorDir); out.print(','); out.print(motorSpeedVal); out.print(',');
+  out.print(ax_f,3); out.print(','); out.print(ay_f,3); out.print(','); out.print(az_f,3); out.print(',');
+  out.print(gy,3);   out.print(','); out.print(gz,3);   out.print(',');
+  out.println(pitch_f,2);
+}
+void sendTelemetry(){ sendCSV(Serial); sendCSV(BTSerial); }
+
+void setup(){
+  pinMode(MotorSpeedPin,OUTPUT); pinMode(CWPin,OUTPUT); pinMode(CCWPin,OUTPUT);
+  digitalWrite(CWPin,LOW); digitalWrite(CCWPin,LOW); motorPWM(0);
+  Serial.begin(9600); BTSerial.begin(9600);
+  bool ok = mpuBegin();
+  if(!ok){ Serial.println("MPU FAIL"); BTSerial.println("MPU FAIL"); }
+}
+
+void loop(){
+  mpuReadRaw();
+  updateComplementaryFilter();
+
+  Cds1Val = readCds1();
+  Cds2Val = readCds2();
+
+  // ── 조도 로직 (히스테리시스 적용) ──
+  // 둘 다 '충분히 어두움'이면 한쪽으로 탐색 회전 (CW)
+  if (Cds1Val < TH_BRIGHT && Cds2Val < TH_BRIGHT) {
+  // 둘 다 충분히 밝음 → 정지
+  motorStop();
+}
+  else if (Cds1Val > TH_DARK && Cds2Val > TH_DARK) {
+    // 둘 다 어두움 → 탐색용 CW 회전
+    motorCW();
+    motorPWM(PWM_CW);
+  }
+  else {
+    // 좌/우 비교
+    if (Cds1Val > Cds2Val) {       // 오른쪽이 더 밝음 → CW
+      motorCW();
+      motorPWM(PWM_CW);
+    } else {                       // 왼쪽이 더 밝음 → CCW
+      motorCCW();
+      motorPWM(PWM_CCW);
+    }
+  }
+
+    sendTelemetry();
+    delay(10);
+  }
