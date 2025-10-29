@@ -1,0 +1,197 @@
+#include <Wire.h>
+#include <SoftwareSerial.h>
+
+// ==============================
+// 하드웨어/센서 설정
+// ==============================
+static const uint8_t MPU_ADDR = 0x68;     // MPU6050 I2C 주소
+static const uint8_t REG_PWR_MGMT_1 = 0x6B;
+static const uint8_t REG_DATA_START = 0x3B;
+
+SoftwareSerial BTSerial(1, 0);            // RX=1, TX=0 (보드에 맞게 유지)
+
+// ---------------- 핀 설정 ----------------
+#define PIN_PWM   5   // 모터 속도(PWM)
+#define PIN_CCW   4   // 반시계 방향
+#define PIN_CW    3   // 시계 방향
+
+// ==============================
+// 제어/상태 변수
+// ==============================
+
+// PID 게인
+double Kp_g = 0.05;
+double Ki_g = 0.0003;
+double Kd_g = 0.04;
+
+// 목표 각속도(±250 dps 범위 가정)
+double setpoint_dps = 80.0;
+
+// 에러 및 PID 항
+double err = 0.0;
+double err_prev = 0.0;
+double u_p = 0.0, u_i = 0.0, u_d = 0.0;
+
+// 출력 및 제한
+double u = 0.0;
+double u_min = 100.0;
+double u_max = 200.0;
+
+// 타이밍
+unsigned long t_prev_us = 0;
+
+// 센서 원시값
+int16_t ax_raw = 0, ay_raw = 0, az_raw = 0;
+int16_t gx_raw = 0, gy_raw = 0, gz_raw = 0;
+int16_t tmp_raw = 0;
+
+// 스케일/오프셋
+double ax_bias = 0.0, ay_bias = 0.0, az_bias = 0.0;
+double gx_bias = 0.0, gy_bias = 0.0, gz_bias = 0.0;
+
+// 가속/자이로 스케일 변환
+// MPU6050 기본 감도: 자이로 131 LSB/(deg/s) @ ±250 dps
+double gx_dps = 0.0;
+
+// 모터 방향 표시용
+int spinDir = 0; // 0 = CCW 고정
+
+// ==============================
+// 선언
+// ==============================
+void imuCalibrate();
+void readImuOnce();
+void pidStep(double dt_sec);
+void btBridge();
+
+// ==============================
+// 초기 설정
+// ==============================
+void setup() {
+  pinMode(PIN_PWM, OUTPUT);
+  pinMode(PIN_CCW, OUTPUT);
+  pinMode(PIN_CW, OUTPUT);
+
+  Serial.begin(9600);
+  BTSerial.begin(9600);
+
+  Wire.begin();
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(REG_PWR_MGMT_1);
+  Wire.write(0x00); // 슬립 해제
+  Wire.endTransmission(true);
+
+  imuCalibrate();           // 오프셋 평균 계산
+  t_prev_us = micros();     // 타이머 초기화
+}
+
+// ==============================
+// 메인 루프
+// ==============================
+void loop() {
+  unsigned long t_now_us = micros();
+  double dt = (t_now_us - t_prev_us) / 1000000.0; // 초 단위
+  t_prev_us = t_now_us;
+
+  readImuOnce();   // 센서 읽기
+  delay(10);
+
+  pidStep(dt);     // PID 1스텝
+  delay(10);
+
+  // PID
+  u_p = Kp_g * err;
+  u_i += Ki_g * err * dt_sec;
+  u_d = Kd_g * (err - err_prev) / (dt_sec > 0 ? dt_sec : 1e-6);
+
+  u = u_p + u_i + u_d;
+
+  digitalWrite(PIN_CW, LOW);
+  digitalWrite(PIN_CCW, HIGH);
+  spinDir = 0;
+
+  // 출력 제한
+  u = constrain(u, u_min, u_max);
+
+  // PWM 출력
+  analogWrite(PIN_PWM, static_cast<int>(u));
+
+  // 상태 갱신
+  err_prev = err;
+
+  // 디버그 출력 
+  Serial.print(gx_dps);        Serial.print(" , ");
+  Serial.print(err);           Serial.print(" , ");
+  Serial.print(u);             Serial.print(" , ");
+  Serial.println(spinDir);
+}
+
+// ==============================
+// MPU6050 보정
+// ==============================
+void imuCalibrate() {
+  const int N = 2000;
+  Serial.print("Calibrating...");
+
+  double ax_sum = 0.0, ay_sum = 0.0, az_sum = 0.0;
+  double gx_sum = 0.0, gy_sum = 0.0, gz_sum = 0.0;
+
+  for (int i = 0; i < N; i++) {
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(REG_DATA_START);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU_ADDR, (uint8_t)14, (uint8_t)true);
+
+    int16_t ax = (Wire.read() << 8) | Wire.read();
+    int16_t ay = (Wire.read() << 8) | Wire.read();
+    int16_t az = (Wire.read() << 8) | Wire.read();
+    (void)Wire.read(); (void)Wire.read(); // 온도 2바이트 스킵
+    int16_t gx = (Wire.read() << 8) | Wire.read();
+    int16_t gy = (Wire.read() << 8) | Wire.read();
+    int16_t gz = (Wire.read() << 8) | Wire.read();
+
+    ax_sum += ax;
+    ay_sum += ay;
+    az_sum += az;
+    gx_sum += gx;
+    gy_sum += gy;
+    gz_sum += gz;
+
+    delay(1);
+  }
+
+  ax_bias = ax_sum / N;
+  ay_bias = ay_sum / N;
+  az_bias = az_sum / N;
+  gx_bias = gx_sum / N;
+  gy_bias = gy_sum / N;
+  gz_bias = gz_sum / N;
+
+  // 결과 출력
+  Serial.print("Acc X Bias: "); Serial.println(ax_bias);
+  Serial.print("Acc Y Bias: "); Serial.println(ay_bias);
+  Serial.print("Acc Z Bias: "); Serial.println(az_bias);
+  Serial.print("Gyro X Bias: "); Serial.println(gx_bias);
+  Serial.print("Gyro Y Bias: "); Serial.println(gy_bias);
+  Serial.print("Gyro Z Bias: "); Serial.println(gz_bias);
+}
+
+// ==============================
+// MPU6050 데이터 1회 읽기
+// ==============================
+void readImuOnce() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(REG_DATA_START);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, (uint8_t)14, (uint8_t)true);
+
+  ax_raw  = (Wire.read() << 8) | Wire.read();
+  ay_raw  = (Wire.read() << 8) | Wire.read();
+  az_raw  = (Wire.read() << 8) | Wire.read();
+  tmp_raw = (Wire.read() << 8) | Wire.read();
+  gx_raw  = (Wire.read() << 8) | Wire.read();
+  gy_raw  = (Wire.read() << 8) | Wire.read();
+  gz_raw  = (Wire.read() << 8) | Wire.read();
+}
+
+}
